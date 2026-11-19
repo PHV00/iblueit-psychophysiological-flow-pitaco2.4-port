@@ -93,6 +93,23 @@ namespace Ibit.Core.Oximetry.Integration
             return unityPublicationAge + Math.Max(0, queueLagMs) / 1000f;
         }
 
+        // Monotonic time since actual publication, plus estimated age of the
+        // last device sample at that publication. Alignment can be unavailable
+        // during startup; then the old queue-age lower bound remains mandatory.
+        public static float EffectiveAlignedAgeSeconds(float monotonicSincePublication,
+            int queueLagMs, float alignedSampleAgeAtPublicationSeconds)
+        {
+            float minimumAge = EffectiveAgeSeconds(monotonicSincePublication, queueLagMs);
+            if (float.IsNaN(alignedSampleAgeAtPublicationSeconds) ||
+                float.IsInfinity(alignedSampleAgeAtPublicationSeconds) ||
+                alignedSampleAgeAtPublicationSeconds < 0f)
+                return minimumAge;
+            if (float.IsInfinity(minimumAge)) return minimumAge;
+            return monotonicSincePublication + Math.Max(
+                Math.Max(0, queueLagMs) / 1000f,
+                alignedSampleAgeAtPublicationSeconds);
+        }
+
         private static bool HasValidAge(float age, float limit)
         {
             return !float.IsNaN(age) && !float.IsInfinity(age) &&
@@ -173,6 +190,8 @@ namespace Ibit.Core.Oximetry.Integration
         private PpgMeasurement lastPublished;
         private float lastPitacoPublicationAt = -1f;
         private int lastPitacoPublicationQueueLagMs;
+        private double lastPitacoPublicationMonotonicMs = double.NaN;
+        private float lastPitacoAlignedSampleAgeAtPublicationSeconds = float.NaN;
         private float lastLegacyPublicationAt = -1f;
         private double lastLegacyBpm;
         private double lastLegacySpo2;
@@ -226,11 +245,7 @@ namespace Ibit.Core.Oximetry.Integration
             bool samePublication = current != null &&
                 object.ReferenceEquals(current, lastPublished);
             bool bpmHudHold = ppg != null && ppg.HudHoldingRejectedBpm;
-            float publicationAge = lastPitacoPublicationAt >= 0f
-                ? OximetrySnapshotFactory.EffectiveAgeSeconds(
-                    Mathf.Max(0f, Time.unscaledTime - lastPitacoPublicationAt),
-                    lastPitacoPublicationQueueLagMs)
-                : float.PositiveInfinity;
+            float publicationAge = GetPitacoPublicationAgeSeconds();
 
             string cause;
             if (state.Source != OximetrySource.Pitaco24)
@@ -273,6 +288,11 @@ namespace Ibit.Core.Oximetry.Integration
                 " | samePublication=" + samePublication +
                 " | ageS=" + publicationAge.ToString("F2") +
                 " | publishQueueLagMs=" + lastPitacoPublicationQueueLagMs +
+                " | clockAligned=" +
+                    (ppg != null && ppg.HasDeviceClockAlignment) +
+                " | alignedAgeAtPublishMs=" +
+                    (float.IsNaN(lastPitacoAlignedSampleAgeAtPublicationSeconds)
+                        ? "--" : (lastPitacoAlignedSampleAgeAtPublicationSeconds * 1000f).ToString("F1")) +
                 " | bpm=" + FormatReading(state.Bpm) +
                 " | spo2Demo=" + FormatReading(state.SpO2Percent) +
                 " | eligible=" + state.EligibleForLegacySpo2Rules +
@@ -324,10 +344,30 @@ namespace Ibit.Core.Oximetry.Integration
         {
             lastPublished = measurement;
             lastPitacoPublicationAt = Time.unscaledTime;
+            lastPitacoPublicationMonotonicMs =
+                PpgMonotonicClockAligner.HostNowMilliseconds();
+            lastPitacoAlignedSampleAgeAtPublicationSeconds = ppg != null
+                ? ppg.LastPublishedAlignedSampleAgeAtPublishSeconds : float.NaN;
             var manager = PitacoConnectionManager.Active;
             // An old line does NOT become fresh when Unity finally dispatches it.
             lastPitacoPublicationQueueLagMs = manager != null
                 ? Math.Max(0, manager.CurrentDispatchQueueLagMs) : 0;
+        }
+
+        private float GetPitacoPublicationAgeSeconds()
+        {
+            if (lastPitacoPublicationAt < 0f ||
+                double.IsNaN(lastPitacoPublicationMonotonicMs))
+                return float.PositiveInfinity;
+            double nowMs = PpgMonotonicClockAligner.HostNowMilliseconds();
+            double elapsedMs = nowMs - lastPitacoPublicationMonotonicMs;
+            if (double.IsNaN(elapsedMs) || double.IsInfinity(elapsedMs) ||
+                elapsedMs < 0 || elapsedMs > float.MaxValue * 1000.0)
+                return float.PositiveInfinity;
+            return OximetrySnapshotFactory.EffectiveAlignedAgeSeconds(
+                (float)(elapsedMs / 1000.0),
+                lastPitacoPublicationQueueLagMs,
+                lastPitacoAlignedSampleAgeAtPublicationSeconds);
         }
 
         // Called after the legacy Player accepts its next comma-delimited pair.
@@ -350,11 +390,8 @@ namespace Ibit.Core.Oximetry.Integration
                 // a transient invalidation: LastMeasurement gets replaced,
                 // but only successful processing emits OnMeasurement.
                 float age = measurement != null &&
-                    object.ReferenceEquals(measurement, lastPublished) &&
-                    lastPitacoPublicationAt >= 0f
-                    ? OximetrySnapshotFactory.EffectiveAgeSeconds(
-                        Mathf.Max(0f, Time.unscaledTime - lastPitacoPublicationAt),
-                        lastPitacoPublicationQueueLagMs)
+                    object.ReferenceEquals(measurement, lastPublished)
+                    ? GetPitacoPublicationAgeSeconds()
                     : float.PositiveInfinity;
                 return OximetrySnapshotFactory.FromPitaco24(
                     true, ppg != null && ppg.OpticalContactConfirmed,
@@ -402,6 +439,8 @@ namespace Ibit.Core.Oximetry.Integration
             lastPublished = null;
             lastPitacoPublicationAt = -1f;
             lastPitacoPublicationQueueLagMs = 0;
+            lastPitacoPublicationMonotonicMs = double.NaN;
+            lastPitacoAlignedSampleAgeAtPublicationSeconds = float.NaN;
             lastMixerConsumptionAt = -1f;
             mixerConsumptionCount = 0;
             if (Active == this)

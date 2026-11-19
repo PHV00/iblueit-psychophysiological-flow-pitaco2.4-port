@@ -2,6 +2,7 @@
 // Os controladores existentes continuam responsaveis por eventos/protocolos.
 using System;
 using System.Collections.Generic;
+using Stopwatch = System.Diagnostics.Stopwatch;
 using System.Globalization;
 using System.IO;
 using System.IO.Ports;
@@ -18,7 +19,7 @@ namespace Ibit.Core.Serial
     public sealed class PitacoConnectionManager : MonoBehaviour
     {
         public enum Version { None, Pitaco20, Pitaco24 }
-        private enum PacketKind { Connected, Disconnected, Line, Warning }
+        private enum PacketKind { Connected, Disconnected, Line, Warning, CommandTrace }
 
         private sealed class Packet
         {
@@ -26,6 +27,9 @@ namespace Ibit.Core.Serial
             public Version DeviceVersion;
             public string Text;
             public int EnqueuedTick;
+            // Stopwatch time at full-line receipt on the USB worker, BEFORE
+            // main-thread dispatch or Unity scene loading delays.
+            public long ArrivalMonotonicTicks;
         }
 
         public static PitacoConnectionManager Active { get; private set; }
@@ -59,6 +63,7 @@ namespace Ibit.Core.Serial
         // Age since the USB worker enqueued the line currently being dispatched.
         // Valid only during synchronous ManagedLine -> OnMeasurement callbacks.
         private int currentDispatchQueueLagMs;
+        private long currentDispatchArrivalTicks;
 
         // Interval counters: serial producer versus Unity main-thread consumer.
         // Diagnostics only; never throttle, re-order or discard additional lines.
@@ -81,6 +86,8 @@ namespace Ibit.Core.Serial
         public long QueueBudgetExhaustions => Interlocked.Read(ref queueBudgetExhaustions);
         public int PeakQueueLagMs => Volatile.Read(ref peakQueueLagMs);
         public int CurrentDispatchQueueLagMs => currentDispatchQueueLagMs;
+        // Valid only in the synchronous ManagedLine/OnJsonReceived callback.
+        public long CurrentDispatchArrivalTicks => currentDispatchArrivalTicks;
 
         // A instancia e criada ANTES dos Awake dos controladores em qualquer cena.
         // Nao e necessario editar prefabs ou duplicar gerenciadores entre cenas.
@@ -168,6 +175,9 @@ namespace Ibit.Core.Serial
         {
             if (string.IsNullOrEmpty(command)) return;
             lock (outboundLock) outbound.Enqueue(command);
+            // This means requested, NOT necessarily written to the device.
+            Debug.Log("[PITACO-CMD] phase=QUEUED | command=" + command +
+                " | version=" + activeVersion);
         }
 
         private void Update()
@@ -229,6 +239,7 @@ namespace Ibit.Core.Serial
                         // The coordinator and Bridge consume this value
                         // synchronously while the JSON line is dispatched.
                         currentDispatchQueueLagMs = lineLagMs;
+                        currentDispatchArrivalTicks = packet.ArrivalMonotonicTicks;
                         try
                         {
                             if (activeVersion == Version.Pitaco24 && modern != null)
@@ -240,10 +251,18 @@ namespace Ibit.Core.Serial
                         finally
                         {
                             currentDispatchQueueLagMs = 0;
+                            currentDispatchArrivalTicks = 0;
                         }
                         break;
                     case PacketKind.Warning:
                         Debug.LogWarning("[PITACO Manager] " + packet.Text);
+                        break;
+                    case PacketKind.CommandTrace:
+                        // The USB worker reports this only AFTER port.Write.
+                        Debug.Log("[PITACO-CMD] " + packet.Text +
+                            " | workerTickMs=" + packet.EnqueuedTick +
+                            " | dispatchDelayMs=" +
+                            Math.Max(0, unchecked(Environment.TickCount - packet.EnqueuedTick)));
                         break;
                 }
             }
@@ -298,6 +317,9 @@ namespace Ibit.Core.Serial
 
         private void Push(PacketKind kind, Version version, string text)
         {
+            // Capture once in the worker immediately after ReadLine, before
+            // acquiring the queue lock. No wall-clock / UTC dependency.
+            long arrivalTicks = Stopwatch.GetTimestamp();
             lock (inboundLock)
             {
                 if (kind == PacketKind.Line)
@@ -313,7 +335,8 @@ namespace Ibit.Core.Serial
                         peakPendingLines = pendingLines;
                 }
                 inbound.Enqueue(new Packet { Kind = kind, DeviceVersion = version, Text = text,
-                    EnqueuedTick = Environment.TickCount });
+                    EnqueuedTick = Environment.TickCount,
+                    ArrivalMonotonicTicks = arrivalTicks });
             }
         }
 
@@ -329,6 +352,8 @@ namespace Ibit.Core.Serial
                 }
                 // Firmware interpreta caracteres individuais; nunca acrescentar LF.
                 port.Write(command);
+                Push(PacketKind.CommandTrace, Version.Pitaco24,
+                    "phase=SENT | command=" + command + " | port=" + port.PortName);
             }
         }
 
@@ -362,6 +387,9 @@ namespace Ibit.Core.Serial
             port.DiscardInBuffer();
             bool is24 = version == Version.Pitaco24;
             port.Write(is24 ? "i" : "e");
+            Push(PacketKind.CommandTrace, version,
+                "phase=IDENTIFY_SENT | command=" + (is24 ? "i" : "e") +
+                " | port=" + port.PortName);
             return WaitFor(port, is24 ? "echo2.4p" : "echop", handshakeTimeoutMs);
         }
 
@@ -440,7 +468,13 @@ namespace Ibit.Core.Serial
                             finally
                             {
                                 // Encerra a amostragem somente ao finalizar a sessao fisica.
-                                try { port.Write("f"); } catch (Exception) { }
+                                try
+                                {
+                                    port.Write("f");
+                                    Push(PacketKind.CommandTrace, found,
+                                        "phase=SHUTDOWN_SENT | command=f | port=" + portName);
+                                }
+                                catch (Exception) { }
                             }
                         }
                     }

@@ -4,8 +4,20 @@ using NUnit.Framework;
 
 public class OximetryDataBridgeTests
 {
+    [SetUp]
+    public void EnsureDemoDisabledByDefault()
+    {
+        OximetrySnapshotFactory.ConfigureDemoSpo2LegacyRulesForTesting(false);
+    }
+
+    [TearDown]
+    public void RemoveDemoOptInAfterTest()
+    {
+        OximetrySnapshotFactory.ConfigureDemoSpo2LegacyRulesForTesting(false);
+    }
+
     [Test]
-    public void Pitaco24DemoSpo2EnablesLegacyGameplayRulesForIntegrationTest()
+    public void Pitaco24DemoSpo2IsNotEligibleForLegacyGameplayByDefault()
     {
         var reading = new PpgMeasurement(12000, 25, 82, 96, 0.6,
             0.75, "EXPERIMENTAL - NAO CALIBRADO");
@@ -18,7 +30,18 @@ public class OximetryDataBridgeTests
         Assert.IsTrue(snapshot.HasBpm);
         Assert.IsTrue(snapshot.HasSpO2);
         Assert.IsTrue(snapshot.SpO2IsDemonstration);
-        Assert.IsTrue(OximetrySnapshotFactory.EnableDemoSpo2LegacyRulesForTesting);
+        Assert.IsFalse(OximetrySnapshotFactory.EnableDemoSpo2LegacyRulesForTesting);
+        Assert.IsFalse(snapshot.EligibleForLegacySpo2Rules);
+    }
+
+    [Test]
+    public void DemoRulesRequireExplicitEditorOrDevelopmentOptIn()
+    {
+        OximetrySnapshotFactory.ConfigureDemoSpo2LegacyRulesForTesting(true);
+        var reading = new PpgMeasurement(12000, 25, 82, 96, 0.6,
+            0.75, "EXPERIMENTAL - NAO CALIBRADO");
+        var snapshot = OximetrySnapshotFactory.FromPitaco24(
+            true, true, true, reading, 0.4f);
         Assert.IsTrue(snapshot.EligibleForLegacySpo2Rules);
     }
 
@@ -107,7 +130,7 @@ public class OximetryDataBridgeTests
         var fallback = OximetrySnapshotFactory.SelectForLegacyRules(
             primary, unavailableLegacy);
         Assert.AreEqual(OximetrySource.Pitaco24, fallback.Source);
-        Assert.IsTrue(fallback.EligibleForLegacySpo2Rules);
+        Assert.IsFalse(fallback.EligibleForLegacySpo2Rules);
         Assert.IsTrue(fallback.SpO2IsDemonstration);
     }
 

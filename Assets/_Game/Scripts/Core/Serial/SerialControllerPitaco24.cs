@@ -215,6 +215,16 @@ namespace Ibit.Core.Serial
             if (!IsConnected || string.IsNullOrEmpty(message)) return;
             OnSerialMessageReceived?.Invoke(message);
             string line = message.Trim();
+            // Firmware side-channel diagnostics never enter OnJsonReceived,
+            // so surface them explicitly without changing the protocol.
+            if (line.StartsWith("X,PPG_", StringComparison.Ordinal) ||
+                line.StartsWith("X,MAX30105_", StringComparison.Ordinal))
+            {
+                Debug.Log("[PITACO-FW] " + line +
+                    " | unityQueueLagMs=" +
+                    (PitacoConnectionManager.Active != null
+                        ? PitacoConnectionManager.Active.CurrentDispatchQueueLagMs : 0));
+            }
             if (!line.StartsWith("{", StringComparison.Ordinal) ||
                 !line.EndsWith("}", StringComparison.Ordinal))
                 return;
